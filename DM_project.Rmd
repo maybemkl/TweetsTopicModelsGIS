@@ -1,0 +1,462 @@
+---
+title: 'Predicting tweets with topic modelling'
+author: "Mikael Brunila"
+date: "12/29/2017"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    self_contained: yes
+---
+
+```{r global options,echo=F}
+library(knitr)
+opts_chunk$set(warning = F,message = F,error = F)
+
+```
+
+```{r data setup, eval=TRUE, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Load libraries ---------------------------------------------
+library(tidyverse)
+library(stringr)
+library(scales)
+library(tm)
+library(topicmodels)
+library(sf)
+library(ggplot2)
+library(caret)
+library(parallel)
+library(ldatuning)
+library(wordcloud)
+library(leaflet)
+library(RColorBrewer)
+library(magrittr)
+library(htmltools)
+
+# Set seed ---------------------------------------------------
+set.seed(1)
+
+# Set clusters -----------------------------------------------
+nr_cores <- detectCores() - 1
+cluster <- makeCluster(nr_cores, type="FORK")
+
+# Load data --------------------------------------------------
+twitter_polygons <- st_read("tweets_counts_for_datamining.shp")
+
+```
+
+## Introduction 
+
+I fit a regular linear model to Twitter data that I have processed using both topic modelling and GIS methods to see if the frequency of tweets in an area can be predicted using the topics found in tweets. 
+
+To do this, I used tweets from New York City collected during one day. I then got the counts of tweets in the census tracts of New York City using GIS. Additionally, I had to find the optimal amount of topics for my dataset, followed by the actual modelling of topics using Latent Dirichlet-Allocation. I then used a linear model to fit the data, trying to predict the frequency associated with a tweet using the most likely topic for each tweet. To assess the quality of the prediction, I used the square-root of the mean-squared error.
+
+## The Data
+
+The data used here was generated during one day of scraping tweets in the state of New York, using a geographic boundary box and a Python scraper running on a Heroku cloud instance, saving tweets to MongoDB. 
+
+The data was then converted to CSV-format, saving relevant parameters, and processed for analysis using QGIS and R packages for GIS. All tweets outside of New York City were dropped and tweets were compared to spatial data on the census tracts in New York City, to get the amount of tweets per tract. Using the "intersect" function in QGIS, I then got the counts for the tract that each tweet was located in, associating every tweet with the amount of tweets in the tract. This data was then exported as a shapefile of points, with every point representing a tweet, and imported with R to get topics and fit my linear model.
+
+I have used this same Twitter data in the QMSS GIS class to see if tweet counts normalized by area size can act as predictors for gentrification. The raw data was the same, but the preprocessing steps were different. 
+
+## Research question
+
+The rationale for this project emerged from my QMSS GIS project, where I noticed that tweets tend to cluster around certain coordinates. I also discovered the activity of multiple bots. In the following four code blocks I will revisit this discovery (meaning also that I used the same code in my GIS project) to clarify the reasons for exploring the relation between topics and tweet counts.
+
+First, let's see how the data is distributed over 24 hours using simple histograms. As mentioned above, I detectd the presence of many bots in the data. The first histogram shows the distribution of all the tweets. The second one shows the distribution of the data after cleaning it using some keywords that appeared in tweets produced by bots. We can note that some spikes in the data are smoothened out. 
+
+```{r exploration1, echo=FALSE, warning=FALSE}
+
+# Creating a dataframe for "cleaned up" twitter data 
+twitter_data_clean <- twitter_polygons
+
+# Removing links.
+twitter_data_clean$text <- str_replace(twitter_polygons$text, 'http.* *', '')
+
+# Removing tweets with non-unique text to filter for spam.
+twitter_data_clean <- distinct(twitter_data_clean, "text")
+
+# Removing tweets that containt common words used by ad or weather bots.
+twitter_data_clean <- twitter_data_clean %>%
+  filter(!(str_detect(tolower(name),'jobs|traffic|hiring|career|checkoutstore|every lot nyc')))
+
+# Ggplot to get histogram of tweets
+ggplot(twitter_polygons, aes(x = as.POSIXct(date_time,format="%Y-%m-%d %H"))) +
+  geom_histogram(stat = "count") +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H%M") + 
+  labs(x = "Hour", y = "Amount of tweets")
+
+# Ggplot to get histogram of cleaned tweets
+ggplot(twitter_data_clean, aes(x = as.POSIXct(date_time,format="%Y-%m-%d %H"))) +
+  geom_histogram(stat = "count") +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H%M") + 
+  labs(x = "Hour", y = "Amount of tweets")
+
+```
+
+Secondly, I wanted to see how different users and places occur in the data. Using simple exploratory methods, we can see that some users are significantly more active than others. Additionally, some coordinates occur much more frequently in the data than others. The table below shows how many tweets were produced by certain active users. Looking at the head of the list, we see that most of these based on their names seem to be bots. Using both a histogram and boxplot, we can then see how tweets also cluster at certain locations. Most locations have produced only one tweet, but certain locations are the origin of hundreds of tweets, with one location being the origin of up to 1250 tweets! This makes this place a clear outlier in the data.
+
+```{r exploration2, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Getting a summary of the amount of tweets by individual users and saving to dataframe.
+data_summary <- twitter_polygons %>%
+  count(name, screen_nam, user_id) %>%
+  arrange(desc(n))
+
+head(data_summary, 10)
+
+# Getting a summary of the amount of tweets at a given coordinate and saving to dataframe.
+coordinate_summary <- twitter_data_clean %>%
+  count(coordinate) %>%
+  arrange(desc(n))
+
+# Plotting the tweets per coordinate as histogram.
+ggplot(coordinate_summary, aes(x = n)) +
+  geom_histogram(stat = "count", binwidth = 1) +
+  labs(x = "Amount", y = "Tweets at long, lat") +
+  scale_x_continuous(limits = c(0, 100))
+
+# Plotting the tweets per coordinate as boxplot.
+ggplot(coordinate_summary, aes(x = "", y = n)) +
+  geom_boxplot() + 
+  labs(y = "Amount", x = "Tweets at long, lat") +
+  scale_y_continuous()
+
+```
+
+One way to clarfiy what is going on here is to explore the data further by mapping it. To do this, I process the Twitter data so that tweets from a certain location are grouped together. Each data point becomes a location and the weight of this data is given by the amount of tweets from this location. Mapping this, we see that the location with 1250 tweets is in Southern Manhattan, which is probably because this is the generic location for tweets that are tagged as being from New York. Similar, but smaller clusters appear for locations that are generic for all the five borroughs. The second leaflet map shows the data cleaned of all locations with more than ten tweets.
+
+```{r exploration3, echo=FALSE, warning=FALSE, include=TRUE}
+
+i <- 1
+for (entry in coordinate_summary$coordinate) {
+  coordinates <- entry %>%
+    str_split(",")
+  long <- coordinates[[1]][2]
+  lat <- coordinates[[1]][1]
+  coordinate_summary$long[i] <- long
+  coordinate_summary$lat[i] <- lat
+  i <- i + 1
+}
+
+largePoints <- coordinate_summary %>%
+  filter(n >= 10)
+
+withoutLargePoints <- coordinate_summary %>%
+  filter(n < 10)
+
+tweetsMapAllPoints  <- leaflet(coordinate_summary) %>%
+  setView(lng = -74.0060, lat = 40.7128, zoom = 13) %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+  addCircles(~as.numeric(long), ~as.numeric(lat), 
+             radius = ~n*2, label = ~htmlEscape(as.character(n)))
+
+tweetsMapSmallPoints  <- leaflet(withoutLargePoints) %>%
+  setView(lng = -74.0060, lat = 40.7128, zoom = 13) %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+  addCircles(~as.numeric(long), ~as.numeric(lat), 
+             radius = ~n*2, label = ~htmlEscape(as.character(n)))
+
+tweetsMapAllPoints 
+
+
+
+tweetsMapSmallPoints 
+```
+
+What does this exploration show? Tweets cluster around points that are the generic coordinates for a city or borrow. Many of the tweets in these locations are produced about bots, that most commonly write about jobs and sometimes about the weather. Many of the more common locations are also sights like Madison Square garden, Empire State Building etc.
+
+This lead me to the following research question:
+
+**Is there are relation between the amount of tweets produced at a location and the topics of these tweets?**
+
+## Preprocessing for topic model
+
+To detect topics in the data, I use the Latent-Dirichlet Allocation algorithm in the topicmodels package. To do this, we have to preprocess the data so it can more easily be fitted into the topic model.
+
+Taking a step backward and looking at the tweets again, we can see that there are a total of 8546 tweets with 27 features. Most of the features are redundant for our analysis and will be dropped at a later point. Printing the first five tweets in the data, we immediately see that there is a mixture of different things going on. Two bots seem to advertise jobs, while what is more likely to be real people tweet about Rihanna, Halloween and Foursquare (the tweet about Equinox and West 92nd street).
+
+```{r data_dim}
+
+dim(twitter_polygons)
+twitter_polygons$text[1:5]
+
+```
+
+To preprocess the data, I used the standard functions used in most text analysis, tranforming the content to lower case, stripping whitespace, stemming words and removing punctuation, numbers and a set of stopwords. Additionally, I used a function to remove URLs in the data.
+
+If we now look at the five tweets, we see that the preprocessing worked as expected. Numbers have been stripped, words have been stemmed, URLs removed and so on. A wordcloud produced out of the preprocessed data shows that the most common words are related to places in New York and jobs, the latter reflecting the large amount of bots and/or automated tweets about job opportunities.
+
+```{r corpus}
+
+# Load corpus ------------------------------------------------
+corpus.raw <- Corpus(VectorSource(twitter_polygons$text))
+
+# Function to remove URLs ------------------------------------
+removeURL <- content_transformer(function(x) gsub("(f|ht)tp(s?)://\\S+", "", x, perl=TRUE))
+
+# Process corpus  --------------------------------------------
+corpus.processed <- corpus.raw %>%
+  tm_map(removeURL) %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(stripWhitespace) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stemDocument)
+
+# Print five first tweets after preprocessing  ----------------
+for (i in 1:5) {
+    cat(paste("[[", i, "]] ", sep = ""))
+    writeLines(as.character(corpus.processed[[i]]))
+}
+
+# Term Document Matrix for wordcloud --------------------------
+# Document Term Matrix ----------------------------------------
+tdm <- TermDocumentMatrix(corpus.processed)
+m <- as.matrix(tdm)
+v <- sort(rowSums(m),decreasing=TRUE)
+d <- data.frame(word = names(v),freq=v)
+
+# Wordcloud ---------------------------------------------------
+wordcloud(words = d$word, 
+          freq = d$freq,
+          scale = c(5, .4),
+          min.freq = 0, 
+          max.words = 100,
+          colors = brewer.pal(6, "Dark2")
+          )
+
+
+```
+
+To use the data in a topic model, we need to convert it into a document term matrix (DTM), where each row represents a document (a tweet in this case) and each column a term in the entire vocabulary of our corpus. Plotting the relations between terms in the DTM, we see the same connection between job related words that we detected in our exploratory phase.
+
+```{r dtm}
+
+# Document Term Matrix
+dtm <- DocumentTermMatrix(corpus.processed)
+
+# Remove some sparse terms from DTM
+dtms <- removeSparseTerms(dtm, sparse = 0.999)
+
+# Plot dense(r) dtm for connections between words
+plot(dtms, terms = findFreqTerms(dtms, lowfreq = 200), 
+     corThreshold = 0.1)
+
+
+```
+
+Some documents were empty and had therefore to be dropped. This proved to be time consuming, so I used parallelization to do it faster. Printing out the dimensions of this matrix, we note that some 20 rows (documents/tweets) have been dropped. The size of our vocabulary of stemmed words is 15296.
+
+```{r dtm_clean}
+
+# Find the sum of words in each document, using parallelization
+rowTotals <- parApply(cluster, dtm, 1, sum) 
+
+# Remove docs without words
+dtm_noEmpty <- dtm[rowTotals> 0, ]
+dtm_noEmptyMatrix <- as.matrix(dtm_noEmpty)
+
+dim(dtm_noEmptyMatrix)
+
+```
+
+## Topic model
+
+To fit a standard topic model, you have to chose the amount of topics to search for in the data. The method is supervised in this sense, although the detection of topics is unsupervised in the sense that no further parameters like keywords are given (there are semisupervised topic models that allow for this). Fitting one topic model can take a lot of time, especially with the large size of the DTM we use, and hence determining the optimal amount of topics to use is tricky. Luckily, there exists an R package that facilitates this process. The package ldatuning uses parallelization and four different metrics to determine the optimal amount of topics. I ran the FindTopicsNumber with all four metrics, although you could use fewer as well.
+
+The FindTopicsNumber function fits topic models in a certain range of topics and determines which one is the most coherent. Two of the metrics I used are based on minimization (CaoJuan2009, Arun2010) and two on maximization (Griffiths2004, Deveaud2014). I fitted topics for every value between three and ten and then in intervals of ten from 10 to 50. The graphs produced by this do not show the quality of a given amount of topics in an absolute manner, but a relative one. 
+
+The results were ambigious. For topics between three and ten, the optimal amount could be three, nine or ten, depending on the metric. Alternatively we could use five or six topics, if we value the intersection of metric more than the performance of a model on any single metric. Moving on to the range of topics between ten and fifty, the results are equally ambigious. Because of this, I made a pragmatic choice of using ten topics (one max and one min metric perform very well on this amount) and twenty topics (the max and min metrics intersect at 15 and 25, so 20 is some kind of compromise).
+
+```{r ldatuning}
+
+# Find out optimal number of topics using ldatuning package in range 3:10
+optimalTopicsNrUpToTen <- FindTopicsNumber(
+  dtm_noEmpty, 
+  topics = seq(3, 10, by = 1), 
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"), 
+  control = list(seed = 1), 
+  mc.cores = nr_cores,
+  verbose = TRUE
+  )
+
+# Find out optimal number of topics using ldatuning package in range 10:50
+optimalTopicsNr <- FindTopicsNumber(
+  dtm_noEmpty, 
+  topics = seq(10, 50, by = 10), 
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"), 
+  control = list(seed = 1), 
+  mc.cores = nr_cores,
+  verbose = TRUE
+  )
+
+# Plot results from both topics finders
+FindTopicsNumber_plot(optimalTopicsNrUpToTen)
+FindTopicsNumber_plot(optimalTopicsNr)
+```
+
+The next step was to fit and save models with ten and twenty topics. After fitting the models, I use two methods to get a feeling of how well the models fitted.
+
+First, I print out the head of the probability distributions that each document pertains to a certain topic. If documents seem unlikely to belong to any single topic, then the model is probably not very good. Using ten topics doesn't seem all that promising, as the distributions are very even. Among the first six documents, no single document seems to clearly belong to a topic as all the probabilities are about 10%. With twenty topics, the distribution looks much better and most documents have a clear affinity to one topic.
+
+Secondly, we can look at the words associated with topics. They seem unclear with ten topics, but fairly intuitive and distinct with twenty topics.
+
+```{r lda}
+
+# LDA for 10 and 20 topics
+output10 <- LDA(weightTf(dtm_noEmpty ), k = 10)
+output20 <- LDA(weightTf(dtm_noEmpty ), k = 20)
+
+# Print topics for first six tweets
+round(head(posterior(output10, dtm_noEmpty )$topics), digits = 3)
+round(head(posterior(output20, dtm_noEmpty )$topics), digits = 3)
+
+# Get four first terms for topics
+term10 <- terms(output10, 4)
+term20 <- terms(output20, 4) 
+
+# Print topic terms
+term10
+term20
+
+```
+
+## Analysis
+
+For my analysis, I need my GIS and topic data in the same dataframe. This requiers a number of mergin operations, that I perform in the following the block of code. This includes getting the highest topic for each document. This means that I abstract away from the distribution of topics and let each document be represented only by one topic.
+
+```{r mergedata}
+
+# Separate relevant predictors from geodata to dataframe for lm fitting
+twitterAnalysis <- twitter_polygons %>%
+  as.data.frame() %>%
+  select(number = field_1, BoroCD, BoroCode, BoroName, tweets)
+
+# Prepare data to be merged with Twitter dataframe
+lda_df10 <- as.data.frame(posterior(output10, dtm_noEmpty)$topics)
+lda_df20 <- as.data.frame(posterior(output20, dtm_noEmpty)$topics)
+
+# Set columns for merging dataframes
+lda_df10$number <- seq.int(nrow(lda_df10))
+lda_df20$number <- seq.int(nrow(lda_df20))
+
+# Get top topics
+toptopics10 <- as.data.frame(topics(output10))
+toptopics10$number <- seq.int(nrow(toptopics10))
+toptopics20 <- as.data.frame(topics(output20))
+toptopics20$number <- seq.int(nrow(toptopics20))
+
+# Merge dataframes for to get topics, toptopics and Twitter data in same dataframe
+analysis_data10 <- merge(twitterAnalysis, lda_df10, by = "number")
+analysis_data10 <- merge(analysis_data10, toptopics10, by = "number")
+analysis_data10$toptopics <- analysis_data10$`topics(output10)`
+
+# Merge dataframes for to get topics, toptopics and Twitter data in same dataframe
+analysis_data20 <- merge(twitterAnalysis, lda_df20, by = "number")
+analysis_data20 <- merge(analysis_data20, toptopics20, by = "number")
+analysis_data20$toptopics <- analysis_data20$`topics(output20)`
+
+head(analysis_data10$toptopics)
+head(analysis_data20$toptopics)
+
+```
+
+Before fitting the topics to a linear model, I still want to make sure that the distribution of topics looks sensible. The two histograms below depicting this distribution suggests that it is random enough (a worriesome result would show bins of almost equal size, which obviously is not the case in a dataset of tweets that have nothing else in common than the fact that they were authored in New York City and geotagged).
+
+```{r topic_distributions}
+
+# Plot counts for topics in the model with 10 topics
+ggplot(data=analysis_data10, aes(analysis_data10$toptopics)) + 
+  geom_histogram(bins = 10, boundary = 0.5)
+
+# Plot counts for topics in the model with 20 topics
+ggplot(data=analysis_data20, aes(analysis_data20$toptopics)) + 
+  geom_histogram(bins = 20, boundary = 0.5)
+
+```
+
+Proceeding to my actual model, I use simple linear univariate regression to see if there is a connection between the top topic and the amount of tweets that were authored in the census tract that a tweet was published in during the collection of the data. I initially fitted the model as a multivariate linear model with the probability distributions of topics as my predictors, but the results were not really better than the univariate model, so I simplified my analysis to make it clearer.
+
+I actually do not expect the linear model to produce good results, because the topics are not arranged on a scale that could have a linear relationship to the amount of tweets. Why then fit a linear model? The main purpose of this project is to get familiarity with topic models. The linear model shows some ways forward to build an appropriate model and clarifies what this would take, but is not a suitable model by itself.
+
+This becomes evident enough after fitting the models. The predictions are completely off and there is almost no variance in them, suggesting that the model really does not "know" how to fit the data. While the data shows no signs whatsoever of any linear relationships, the two graphs below indicate that there might be other types of (fairly weak) relationships at play. 
+
+```{r linearmodel}
+
+# Split data into train and test for 10 topics
+in_train10 <- createDataPartition(y = analysis_data10$tweets,
+                                p = 3 / 4, 
+                                list = FALSE)
+training10 <- analysis_data10[ in_train10, ]
+testing10  <- analysis_data10[-in_train10, ]
+
+# Fit model and predict. Print sqrt of MSE to get a sense of the accuracy of the prediction
+ols_lm10 <- lm(tweets ~ toptopics, data = training10)
+pred10 <- predict(ols_lm10, newdata = testing10)
+sqrt(mean((testing10$toptopics - pred10) ^ 2))
+
+head(pred10)
+
+# Split data into train and test for 20 topics
+in_train20 <- createDataPartition(y = analysis_data20$tweets,
+                                p = 3 / 4, 
+                                list = FALSE)
+training20 <- analysis_data20[ in_train20, ]
+testing20  <- analysis_data20[-in_train20, ]
+
+# Fit model and predict. Print sqrt of MSE to get a sense of the accuracy of the prediction
+ols_lm20 <- lm(tweets ~ toptopics, data = training20)
+pred20 <- predict(ols_lm20, newdata = testing20)
+sqrt(mean((testing20$toptopics - pred20) ^ 2))
+
+head(pred20)
+
+# Plot counts for 20 topics and tweet counts
+ggplot(analysis_data20, aes(toptopics, tweets)) +
+  geom_count()
+
+# Plot density for 20 topics and tweet count
+ggplot(analysis_data20, aes(toptopics, tweets)) +
+  geom_density_2d()
+
+```
+
+Finally, I wanted to plot the topics to a map to see if any clustering could be detected. Because mapping data with more than ten levels is hard to do in an informative and beautiful way, I chose to map just the data with ten topics. The map below does not suggest any clustering that would be intuitive with the bare eye.
+
+```{r topic_map, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+names(twitter_polygons)[names(twitter_polygons) == 'field_1'] <- 'number'
+
+analysis_data_map <- merge(twitter_polygons, analysis_data10[,c("number", "toptopics")], by = "number")
+
+names(analysis_data_map)[names(analysis_data_map) == 'toptopics.x'] <- 'toptopics10'
+
+pal <- colorFactor(brewer.pal(5,"Set3"), domain = 1:10)
+
+# Mapping rates of change.
+map <- leaflet(analysis_data_map) %>% 
+  setView(lng = -74.0060, lat = 40.7128, zoom = 11) %>%
+  addProviderTiles(providers$CartoDB.PositronNoLabels) %>%
+  addCircleMarkers(data = analysis_data_map, ~as.numeric(lat), ~as.numeric(long), 
+             color = ~pal(toptopics), fillColor = ~pal(toptopics),
+             opacity = 0.8, radius = 1) %>%
+  addLegend("bottomright", pal = pal, values = ~toptopics,
+    title = "Topics",
+    opacity = 1
+  )
+
+# Outputting map
+map
+
+```
+
+## Conclusions
+
+When starting this project, I had my doubts whether topic models would be useful with tweets in the first instance. One conclusion is, that topic models can be used to extract intuitive topics from tweets, despite the fact that these are very short documents. However, using these topics as predictors is tricky. 
+
+Moving forward, I would use a geographically weightened non-linear model with spatial lag or spatial error. I would also check for spatial clustering, perhaps abandoning the pursuit to find clear causal relationships altogether and sticking to a more exlporatory analysis.
+
+
