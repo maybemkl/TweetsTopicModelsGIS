@@ -10,6 +10,7 @@ output:
 ---
 
 ```{r global options,echo=F}
+
 library(knitr)
 opts_chunk$set(warning = F,message = F,error = F)
 
@@ -42,13 +43,13 @@ nr_cores <- detectCores() - 1
 cluster <- makeCluster(nr_cores, type="FORK")
 
 # Load data --------------------------------------------------
-twitter_polygons <- st_read("tweets_counts_for_datamining.shp")
+twitter_polygons <- st_read("data/tweets_counts_for_datamining.shp")
 
 ```
 
 ## Introduction 
 
-I fit a regular linear model to Twitter data that I have processed using both topic modelling and GIS methods to see if the frequency of tweets in an area can be predicted using the topics found in tweets. 
+I fit a regular linear model to Twitter data that I have processed using both topic modelling and GIS methods to see if the frequency of tweets in an area can be predicted using the topics found in the tweets. 
 
 To do this, I used tweets from New York City collected during one day. I then got the counts of tweets in the census tracts of New York City using GIS. Additionally, I had to find the optimal amount of topics for my dataset, followed by the actual modelling of topics using Latent Dirichlet-Allocation. I then used a linear model to fit the data, trying to predict the frequency associated with a tweet using the most likely topic for each tweet. To assess the quality of the prediction, I used the square-root of the mean-squared error.
 
@@ -56,7 +57,7 @@ To do this, I used tweets from New York City collected during one day. I then go
 
 The data used here was generated during one day of scraping tweets in the state of New York, using a geographic boundary box and a Python scraper running on a Heroku cloud instance, saving tweets to MongoDB. 
 
-The data was then converted to CSV-format, saving relevant parameters, and processed for analysis using QGIS and R packages for GIS. All tweets outside of New York City were dropped and tweets were compared to spatial data on the census tracts in New York City, to get the amount of tweets per tract. Using the "intersect" function in QGIS, I then got the counts for the tract that each tweet was located in, associating every tweet with the amount of tweets in the tract. This data was then exported as a shapefile of points, with every point representing a tweet, and imported with R to get topics and fit my linear model.
+The data was then converted to CSV-format, saving relevant parameters, and processed for analysis using QGIS and R packages for GIS analysis. All tweets outside of New York City were dropped and tweets were compared to spatial data on the census tracts in New York City, to get the amount of tweets per tract. Using the "intersect" function in QGIS, I then got the counts for the tract that each tweet was located in, associating every tweet with the amount of tweets in the tract. This data was then exported as a shapefile of points, with every point representing a tweet, and imported with R to get topics and fit my linear model.
 
 I have used this same Twitter data in the QMSS GIS class to see if tweet counts normalized by area size can act as predictors for gentrification. The raw data was the same, but the preprocessing steps were different. 
 
@@ -95,7 +96,7 @@ ggplot(twitter_data_clean, aes(x = as.POSIXct(date_time,format="%Y-%m-%d %H"))) 
 
 ```
 
-Secondly, I wanted to see how different users and places occur in the data. Using simple exploratory methods, we can see that some users are significantly more active than others. Additionally, some coordinates occur much more frequently in the data than others. The table below shows how many tweets were produced by certain active users. Looking at the head of the list, we see that most of these based on their names seem to be bots. Using both a histogram and boxplot, we can then see how tweets also cluster at certain locations. Most locations have produced only one tweet, but certain locations are the origin of hundreds of tweets, with one location being the origin of up to 1250 tweets! This makes this place a clear outlier in the data.
+Secondly, I wanted to see how different users and places occur in the data. Using simple exploratory methods, we can see that some users are significantly more active than others. Additionally, some coordinates occur much more frequently in the data than others. The table below shows how many tweets were produced by certain active users. Looking at the head of the list, we see that most of these seem to be bots, at least based on their names. Using both a histogram and boxplot, we can then see how tweets also cluster at certain locations. Most locations have produced only one tweet, but certain locations are the origin of hundreds of tweets, with one location being the origin of up to 1250 tweets! This makes this place a clear outlier in the data.
 
 ```{r exploration2, echo=FALSE, message=FALSE, warning=FALSE}
 
@@ -165,7 +166,7 @@ tweetsMapAllPoints
 tweetsMapSmallPoints 
 ```
 
-What does this exploration show? Tweets cluster around points that are the generic coordinates for a city or borrow. Many of the tweets in these locations are produced about bots, that most commonly write about jobs and sometimes about the weather. Many of the more common locations are also sights like Madison Square garden, Empire State Building etc.
+What does this exploration show? Tweets cluster around points that are the generic coordinates for a city or borrow. Many of the tweets in these locations are produced by bots, most commonly writing about jobs and sometimes about the weather. Many of the more common locations are also sights like Madison Square garden, Empire State Building etc.
 
 This lead me to the following research question:
 
@@ -455,7 +456,7 @@ map
 
 ## Conclusions
 
-When starting this project, I had my doubts whether topic models would be useful with tweets in the first instance. One conclusion is, that topic models can be used to extract intuitive topics from tweets, despite the fact that these are very short documents. However, using these topics as predictors is tricky. 
+When starting this project, I had my doubts whether topic models would be useful with tweets in the first instance. One conclusion is, that topic models can be used to extract intuitive topics from tweets, despite the fact that tweets are very short documents (especially since this project occured after tweets were given 240 instead of 140 characters). However, using these topics as predictors is tricky. 
 
 Moving forward, I would use a geographically weightened non-linear model with spatial lag or spatial error. I would also check for spatial clustering, perhaps abandoning the pursuit to find clear causal relationships altogether and sticking to a more exlporatory analysis.
 
